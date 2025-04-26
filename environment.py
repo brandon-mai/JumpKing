@@ -15,7 +15,7 @@ class Environment:
 		os.environ["hitboxes"] = ""
 		os.environ["screen_width"], os.environ["screen_height"] = str(480), str(360)
 		os.environ["window_scale"] = "1"
-		os.environ["fps"] = str(120)
+		os.environ["fps"] = str(60)
 		os.environ["bg_color"] = str((0, 0, 0))
 		os.environ["mode"] = "normal"
 		os.environ["start"] = ""

@@ -40,15 +40,20 @@ def get_action_dict(agentCommand):
 		keys[pygame.K_RIGHT] = 0
 		keys[pygame.K_LEFT] = 1
 
-	# elif agentCommand == 4:
-	# 	keys[pygame.K_SPACE] = 0
-	# 	keys[pygame.K_RIGHT] = 0
-	# 	keys[pygame.K_LEFT] = 0
-	#
-	# elif agentCommand == 5:
-	# 	keys[pygame.K_SPACE] = 1
-	# 	keys[pygame.K_RIGHT] = 0
-	# 	keys[pygame.K_LEFT] = 0
+	elif agentCommand == 'space':
+		keys[pygame.K_SPACE] = 1
+		keys[pygame.K_RIGHT] = 0
+		keys[pygame.K_LEFT] = 0
+
+	elif agentCommand == 'right':
+		keys[pygame.K_SPACE] = 0
+		keys[pygame.K_RIGHT] = 1
+		keys[pygame.K_LEFT] = 0
+
+	elif agentCommand == 'left':
+		keys[pygame.K_SPACE] = 0
+		keys[pygame.K_RIGHT] = 0
+		keys[pygame.K_LEFT] = 1
 
 	else:
 		print(agentCommand)
@@ -317,69 +322,69 @@ class King():
 			self.isWalk = False
 
 	def _check_events(self, agentCommand=None):
-			if agentCommand is not None:
-				keys = get_action_dict(agentCommand)
-			else:
-				keys = pygame.key.get_pressed()
+		if agentCommand is not None:
+			keys = get_action_dict(agentCommand)
+		else:
+			keys = pygame.key.get_pressed()
 
-			if not self.isSplat or self.splatCount > self.splatDuration:
+		if not self.isSplat or self.splatCount > self.splatDuration:
 
-				if keys[pygame.K_SPACE]:
-					self.splatCount = 0
-					self.idle_counter = 0
-					self.jumpCount += 1
+			if keys[pygame.K_SPACE]:
+				self.splatCount = 0
+				self.idle_counter = 0
+				self.jumpCount += 1
 
-					if not self.isCrouch:
+				if not self.isCrouch:
 
-						self.isCrouch = True
+					self.isCrouch = True
 
-					elif self.jumpCount > self.maxJumpCount:
-
-						if keys[pygame.K_RIGHT]:
-
-							self._jump("right")
-
-						elif keys[pygame.K_LEFT]:
-
-							self._jump("left")
-						else:
-							self._jump("up")
-
-				else:
+				elif self.jumpCount > self.maxJumpCount:
 
 					if keys[pygame.K_RIGHT]:
-						self.splatCount = 0
-						self.idle_counter = 0
 
-						# Walk
-						if not self.isCrouch:
-							self._walk("right")
-						# Jump
-						else:
-							self._jump("right")
+						self._jump("right")
 
 					elif keys[pygame.K_LEFT]:
-						self.splatCount = 0
-						self.idle_counter = 0
 
-						#Walk
-						if not self.isCrouch:
-							self._walk("left")
-						#Jump
-						else:
-							self._jump("left")
+						self._jump("left")
 					else:
-
-						self.idle_counter += 1
-
-						self.isWalk = False
-
-						if self.isCrouch:
-							self._jump("up")
+						self._jump("up")
 
 			else:
 
-				self.splatCount += 1
+				if keys[pygame.K_RIGHT]:
+					self.splatCount = 0
+					self.idle_counter = 0
+
+					# Walk
+					if not self.isCrouch:
+						self._walk("right")
+					# premature Jump
+					else:
+						self._jump("right")
+
+				elif keys[pygame.K_LEFT]:
+					self.splatCount = 0
+					self.idle_counter = 0
+
+					# Walk
+					if not self.isCrouch:
+						self._walk("left")
+					# premature Jump
+					else:
+						self._jump("left")
+				else:
+
+					self.idle_counter += 1
+
+					self.isWalk = False
+
+					if self.isCrouch:
+						self._jump("up")
+
+		else:
+
+			self.splatCount += 1
 
 	def _add_gravity(self):
 

@@ -11,6 +11,8 @@ import os
 import inspect
 import pickle
 import numpy as np
+from pygments.lexer import default
+
 from environment import Environment
 from spritesheet import SpriteSheet
 from Background import Backgrounds
@@ -62,13 +64,13 @@ class CNN(torch.nn.Module):
 
 	def __build_cnn(self, c, output_dim):
 		return nn.Sequential(
-			nn.Conv2d(in_channels=c, out_channels=32, kernel_size=8, stride=4),
+			nn.Conv2d(in_channels=c, out_channels=32, kernel_size=8, stride=4), # 32x20x20
 			nn.ReLU(),
-			nn.Conv2d(in_channels=32, out_channels=64, kernel_size=4, stride=2),
+			nn.Conv2d(in_channels=32, out_channels=64, kernel_size=4, stride=2), # 64x9x9
 			nn.ReLU(),
-			nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, stride=1),
+			nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, stride=1), # 64x7x7
 			nn.ReLU(),
-			nn.Flatten(),
+			nn.Flatten(0),
 			nn.Linear(3136, 512),
 			nn.ReLU(),
 			nn.Linear(512, output_dim),
@@ -113,10 +115,11 @@ class DDQN(object):
 
 		# EXPLOIT
 		else:
+			print("we are exploiting, baby")
 			state = state[0].__array__() if isinstance(state, tuple) else state.__array__()
 			state = torch.tensor(state, device=self.device).unsqueeze(0)
 			action_values = self.net(state, model="online")
-			action_idx = torch.argmax(action_values, axis=1).item()
+			action_idx = torch.argmax(action_values).item()
 
 		# decrease exploration_rate
 		self.exploration_rate *= self.exploration_rate_decay
@@ -157,6 +160,9 @@ class DDQN(object):
 	def td_estimate(self, state, action):
 		"""In-training net's TD estimation
 		"""
+		if state.shape[1] != 1:
+			state = state.permute(0, 3, 1, 2)
+
 		current_Q = self.net(state, model="online")[
 			np.arange(0, self.batch_size), action
 		]  # Q_online(s,a)
@@ -166,8 +172,11 @@ class DDQN(object):
 	def td_target(self, reward, next_state, done):
 		"""Target net's TD estimation, following DDQN's formula
 		"""
+		if next_state.shape[1] != 1:
+			next_state = next_state.permute(0, 3, 1, 2)
+
 		next_state_Q = self.net(next_state, model="online")
-		best_action = torch.argmax(next_state_Q, axis=1)
+		best_action = torch.argmax(next_state_Q)
 		next_Q = self.net(next_state, model="target")[
 			np.arange(0, self.batch_size), best_action
 		]
@@ -224,7 +233,7 @@ class DDQN(object):
 class JKGame:
 	""" Overall class to manga game aspects """
         
-	def __init__(self, max_step=float('inf')):
+	def __init__(self, max_step=float('inf'), fps=60):
 
 		pygame.init()
 
@@ -232,7 +241,7 @@ class JKGame:
 
 		self.clock = pygame.time.Clock()
 
-		self.fps = int(os.environ.get("fps"))
+		self.fps = fps if isinstance(fps, int) else int(os.environ.get("fps"))
  
 		self.bg_color = (0, 0, 0)
 
@@ -281,6 +290,12 @@ class JKGame:
 
 		return state
 
+	def update_av(self):
+		self._update_gamescreen()
+		self._update_guistuff()
+		self._update_audio()
+		pygame.display.update()
+
 	def move_available(self):
 		available = not self.king.isFalling \
 					and not self.king.levels.ending \
@@ -300,38 +315,72 @@ class JKGame:
 		return screen_arr
 
 	def step(self, action):
+		# ================ Record values before taking actions ================
 		old_level = self.king.levels.current_level
 		old_y = self.king.y
 		#old_y = (self.king.levels.max_level - self.king.levels.current_level) * 360 + self.king.y
+
+		# ============= Convert action int to stream of keypress =============
+		match action:
+			case 0:
+				key_stream = ['right']
+			case 1:
+				key_stream = ['left']
+			case 2:
+				key_stream = ['space'] * 5 + ['right']
+			case 3:
+				key_stream = ['space'] * 5 + ['left']
+			case 4:
+				key_stream = ['space'] * 15 + ['right']
+			case 5:
+				key_stream = ['space'] * 15 + ['left']
+			case 6:
+				key_stream = ['space'] * 30 + ['right']
+			case 7:
+				key_stream = ['space'] * 30 + ['left']
+			case _:
+				key_stream = [action]
+		key_stream = iter(key_stream)
+
 		while True:
 			self.clock.tick(self.fps)
 			self._check_events()
-			if not os.environ["pause"]:
-				if not self.move_available():
-					action = None
-				self._update_gamestuff(action=action) # SEND A SINGLE COMMAND TO KING HERE
 
-			self._update_gamescreen()
-			self._update_guistuff()
-			self._update_audio()
-			pygame.display.update()
+			if os.environ["pause"]:
+				self.update_av()
+				continue
+
+			try:
+				self._update_gamestuff(action=next(key_stream))
+				self.update_av()
+				continue
+			except StopIteration:
+				self._update_gamestuff(action=None)
+				self.update_av()
 
 			if self.move_available():
 				self.step_counter += 1
 				# state = [self.king.levels.current_level, self.king.x, self.king.y, self.king.jumpCount]
 				state = self.get_screen_array()
-				##################################################################################################
-				# Define the reward from environment                                                             #
-				##################################################################################################
-				if self.king.levels.current_level > old_level or (self.king.levels.current_level == old_level and self.king.y < old_y):
+
+				# =========================== Define the reward from environment ===========================
+				if self.king.levels.current_level > old_level or (
+						self.king.levels.current_level == old_level and self.king.y < old_y):
 					reward = 0
 				else:
-					self.visited[(self.king.levels.current_level, self.king.y)] = self.visited.get((self.king.levels.current_level, self.king.y), 0) + 1
-					if self.visited[(self.king.levels.current_level, self.king.y)] < self.visited[(old_level, old_y)]:
-						self.visited[(self.king.levels.current_level, self.king.y)] = self.visited[(old_level, old_y)] + 1
+					current_key = (self.king.levels.current_level, self.king.y)
+					old_key = (old_level, old_y)
 
-					reward = -self.visited[(self.king.levels.current_level, self.king.y)]
-				####################################################################################################
+					# Update current position visit count
+					self.visited[current_key] = self.visited.get(current_key, 0) + 1
+
+					# If current position has been visited less than previous, add previous count as base count
+					old_pos_count = self.visited.get(old_key, 0)
+					if self.visited[current_key] < old_pos_count:
+						self.visited[current_key] = old_pos_count + 1
+
+					# Negative reward based on visit count
+					reward = -self.visited[current_key]
 
 				done = True if self.step_counter > self.max_step else False
 				return state, reward, done
@@ -347,8 +396,12 @@ class JKGame:
 			#print(state)
 			self.clock.tick(self.fps)
 			self._check_events()
-			if not os.environ["pause"]:
-				self._update_gamestuff()
+
+			if os.environ["pause"]:
+				self.update_av()
+				continue
+
+			self._update_gamestuff()
 
 			self._update_gamescreen()
 			self._update_guistuff()
@@ -515,15 +568,16 @@ def train():
 	print(f"Using CUDA: {use_cuda}")
 	print()
 
-	env = JKGame(max_step=1000)
+	env = JKGame(max_step=1000, fps=360)
 	save_dir = Path("checkpoints") / datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
 	save_dir.mkdir(parents=True)
-
-	agent = DDQN(state_dim=(4, 84, 84), action_dim=4, save_dir=save_dir)
-
+	agent = DDQN(state_dim=(1, 84, 84), action_dim=8, save_dir=save_dir)
 	logger = MetricLogger(save_dir)
 
-	episodes = 40
+	episodes = 10
+	test_action = [2] * 5 + [0] + [2] * 15 + [1] + [2] * 25 + [0] + [0] * 1000
+	test_action = iter(test_action)
+
 	for e in range(episodes):
 
 		state = env.reset()
@@ -533,6 +587,7 @@ def train():
 
 			# Run agent on the state
 			action = agent.act(state)
+			# action = next(test_action)
 
 			# Agent performs action
 			next_state, reward, done = env.step(action)
@@ -555,7 +610,7 @@ def train():
 
 		logger.log_episode()
 
-		if (e % 20 == 0) or (e == episodes - 1):
+		if (e % 1 == 0) or (e == episodes - 1):
 			logger.record(episode=e, epsilon=agent.exploration_rate, step=agent.curr_step)
 
 			
