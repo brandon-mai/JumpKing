@@ -1,7 +1,9 @@
 #!/usr/env/bin python
 #   
 # Game Screen
-# 
+#
+from datetime import datetime
+from pathlib import Path
 
 import pygame 
 import sys
@@ -16,8 +18,8 @@ from King import King
 from Babe import Babe
 from Level import Levels
 from Menu import Menus
-
 from Start import Start
+from MetricLogger import MetricLogger
 
 import torch
 import torch.nn as nn
@@ -25,126 +27,198 @@ import torch.nn.functional as F
 import torch.optim as optim
 import random
 import time
+import matplotlib.pyplot as plt
+import torchvision.transforms as T
+from tensordict import TensorDict
+from torchrl.data import TensorDictReplayBuffer, LazyMemmapStorage
 
 
-class NETWORK(torch.nn.Module):
-	def __init__(self, input_dim: int, output_dim: int, hidden_dim: int) -> None:
-		"""DQN Network example
-        Args:
-            input_dim (int): `state` dimension.
-                `state` is 2-D tensor of shape (n, input_dim)
-            output_dim (int): Number of actions.
-                Q_value is 2-D tensor of shape (n, output_dim)
-            hidden_dim (int): Hidden dimension in fc layer
-        """
-		super(NETWORK, self).__init__()
+class CNN(torch.nn.Module):
+	"""mini CNN structure
+	input -> (conv2d + relu) x 3 -> flatten -> (dense + relu) x 2 -> output
+	"""
+	def __init__(self, input_dim, output_dim):
+		super().__init__()
+		c, h, w = input_dim
 
-		self.layer1 = torch.nn.Sequential(
-			torch.nn.Linear(input_dim, hidden_dim),
-			torch.nn.ReLU()
+		if h != 84:
+			raise ValueError(f"Expecting input height: 84, got: {h}")
+		if w != 84:
+			raise ValueError(f"Expecting input width: 84, got: {w}")
+
+		self.online = self.__build_cnn(c, output_dim)
+		self.target = self.__build_cnn(c, output_dim)
+		self.target.load_state_dict(self.online.state_dict())
+
+		# Q_target parameters are frozen.
+		for p in self.target.parameters():
+			p.requires_grad = False
+
+	def forward(self, input, model):
+		if model == "online":
+			return self.online(input)
+		elif model == "target":
+			return self.target(input)
+
+	def __build_cnn(self, c, output_dim):
+		return nn.Sequential(
+			nn.Conv2d(in_channels=c, out_channels=32, kernel_size=8, stride=4),
+			nn.ReLU(),
+			nn.Conv2d(in_channels=32, out_channels=64, kernel_size=4, stride=2),
+			nn.ReLU(),
+			nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, stride=1),
+			nn.ReLU(),
+			nn.Flatten(),
+			nn.Linear(3136, 512),
+			nn.ReLU(),
+			nn.Linear(512, output_dim),
 		)
-
-		self.layer2 = torch.nn.Sequential(
-			torch.nn.Linear(hidden_dim, hidden_dim),
-			torch.nn.ReLU()
-		)
-
-		self.final = torch.nn.Linear(hidden_dim, output_dim)
-
-	def forward(self, x: torch.Tensor) -> torch.Tensor:
-		"""Returns a Q_value
-        Args:
-            x (torch.Tensor): `State` 2-D tensor of shape (n, input_dim)
-        Returns:
-            torch.Tensor: Q_value, 2-D tensor of shape (n, output_dim)
-        """
-		x = self.layer1(x)
-		x = self.layer2(x)
-		x = self.final(x)
-
-		return x
 
 
 class DDQN(object):
-	def __init__(
-			self
-	):
-		self.target_net = NETWORK(4, 4, 32)
-		self.eval_net = NETWORK(4, 4, 32)
+	def __init__(self, state_dim, action_dim, save_dir):
+		self.state_dim = state_dim
+		self.action_dim = action_dim
+		self.save_dir = save_dir
 
-		self.optimizer = torch.optim.Adam(self.eval_net.parameters(), lr=0.001)
-		self.criterion = nn.MSELoss()
+		self.device = "cuda" if torch.cuda.is_available() else "cpu"
+		self.net = CNN(self.state_dim, self.action_dim).float()
+		self.net = self.net.to(device=self.device)
 
-		self.memory_counter = 0
-		self.memory_size = 50000
-		self.memory = np.zeros((self.memory_size, 11))
+		self.exploration_rate = 1
+		self.exploration_rate_decay = 0.99999975
+		self.exploration_rate_min = 0.1
+		self.curr_step = 0
+		self.memory = TensorDictReplayBuffer(storage=LazyMemmapStorage(100000, device=torch.device("cpu")))
+		self.batch_size = 32
+		self.gamma = 0.9
+		self.optimizer = torch.optim.Adam(self.net.parameters(), lr=0.00025)
+		self.loss_fn = torch.nn.SmoothL1Loss()
 
-		self.epsilon = 1.0
-		self.epsilon_decay = 0.95
-		self.alpha = 0.99
+		self.burnin = 1e4  # min. experiences before training
+		self.learn_every = 3  # no. of experiences between updates to Q_online
+		self.sync_every = 1e4  # no. of experiences between Q_target & Q_online sync
+		self.save_every = 5e5  # no. of experiences between saving NETWORK
 
-		self.batch_size = 64
-		self.episode_counter = 0
+	def act(self, state):
+		"""Given a state, choose an epsilon-greedy action and update value of step.
+		Args:
+			state (LazyFrame): A single observation of the current state, dimension is (state_dim)
+		Returns:
+			int: An integer representing which action Mario will perform
+		"""
+		# EXPLORE
+		if np.random.rand() < self.exploration_rate:
+			action_idx = np.random.randint(self.action_dim)
 
-		self.target_net.load_state_dict(self.eval_net.state_dict())
-
-	def memory_store(self, s0, a0, r, s1, sign):
-		transition = np.concatenate((s0, [a0, r], s1, [sign]))
-		index = self.memory_counter % self.memory_size
-		self.memory[index, :] = transition
-		self.memory_counter += 1
-
-	def select_action(self, states: np.ndarray) -> int:
-		state = torch.unsqueeze(torch.tensor(states).float(), 0)
-		if np.random.uniform() > self.epsilon:
-			logit = self.eval_net(state)
-			action = torch.argmax(logit, 1).item()
+		# EXPLOIT
 		else:
-			action = int(np.random.choice(4, 1))
+			state = state[0].__array__() if isinstance(state, tuple) else state.__array__()
+			state = torch.tensor(state, device=self.device).unsqueeze(0)
+			action_values = self.net(state, model="online")
+			action_idx = torch.argmax(action_values, axis=1).item()
 
-		return action
+		# decrease exploration_rate
+		self.exploration_rate *= self.exploration_rate_decay
+		self.exploration_rate = max(self.exploration_rate_min, self.exploration_rate)
 
-	def policy(self, states: np.ndarray) -> int:
-		state = torch.unsqueeze(torch.tensor(states).float(), 0)
-		logit = self.eval_net(state)
-		action = torch.argmax(logit, 1).item()
+		# increment step
+		self.curr_step += 1
+		return action_idx
 
-		return action
+	def cache(self, state, next_state, action, reward, done):
+		"""Store the experience to self.memory (replay buffer).
+        """
+		def first_if_tuple(x):
+			return x[0] if isinstance(x, tuple) else x
 
-	def train(self, s0, a0, r, s1, sign):
-		if sign == 1:
-			if self.episode_counter % 2 == 0:
-				self.target_net.load_state_dict(self.eval_net.state_dict())
-			self.episode_counter += 1
+		state = first_if_tuple(state).__array__()
+		next_state = first_if_tuple(next_state).__array__()
 
-		self.memory_store(s0, a0, r, s1, sign)
-		self.epsilon = np.clip(self.epsilon * self.epsilon_decay, a_min=0.01, a_max=None)
+		state = torch.tensor(state)
+		next_state = torch.tensor(next_state)
+		action = torch.tensor([action])
+		reward = torch.tensor([reward])
+		done = torch.tensor([done])
 
-		# select batch sample
-		if self.memory_counter > self.memory_size:
-			batch_index = np.random.choice(self.memory_size, size=self.batch_size)
-		else:
-			batch_index = np.random.choice(self.memory_counter, size=self.batch_size)
+		# self.memory.append((state, next_state, action, reward, done,))
+		self.memory.add(
+			TensorDict({"state": state, "next_state": next_state, "action": action, "reward": reward, "done": done},
+					   batch_size=[]))
 
-		batch_memory = self.memory[batch_index]
-		batch_s0 = torch.tensor(batch_memory[:, :4]).float()
-		batch_a0 = torch.tensor(batch_memory[:, 4:5]).long()
-		batch_r = torch.tensor(batch_memory[:, 5:6]).float()
-		batch_s1 = torch.tensor(batch_memory[:, 6:10]).float()
-		batch_sign = torch.tensor(batch_memory[:, 10:11]).long()
+	def recall(self):
+		"""Retrieve a batch of experiences from memory
+        """
+		batch = self.memory.sample(self.batch_size).to(self.device)
+		state, next_state, action, reward, done = (batch.get(key) for key in
+												   ("state", "next_state", "action", "reward", "done"))
+		return state, next_state, action.squeeze(), reward.squeeze(), done.squeeze()
 
-		q_eval = self.eval_net(batch_s0).gather(1, batch_a0)
+	def td_estimate(self, state, action):
+		"""In-training net's TD estimation
+		"""
+		current_Q = self.net(state, model="online")[
+			np.arange(0, self.batch_size), action
+		]  # Q_online(s,a)
+		return current_Q
 
-		with torch.no_grad():
-			maxAction = torch.argmax(self.eval_net(batch_s1), 1, keepdim=True)
-			q_target = batch_r + (1 - batch_sign) * self.alpha * self.target_net(batch_s1).gather(1, maxAction)
+	@torch.no_grad()
+	def td_target(self, reward, next_state, done):
+		"""Target net's TD estimation, following DDQN's formula
+		"""
+		next_state_Q = self.net(next_state, model="online")
+		best_action = torch.argmax(next_state_Q, axis=1)
+		next_Q = self.net(next_state, model="target")[
+			np.arange(0, self.batch_size), best_action
+		]
+		return (reward + (1 - done.float()) * self.gamma * next_Q).float()
 
-		loss = self.criterion(q_eval, q_target)
-
-		# backward
+	def update_Q_online(self, td_estimate, td_target):
+		loss = self.loss_fn(td_estimate, td_target)
 		self.optimizer.zero_grad()
 		loss.backward()
 		self.optimizer.step()
+		return loss.item()
+
+	def sync_Q_target(self):
+		self.net.target.load_state_dict(self.net.online.state_dict())
+
+	def save(self):
+		save_path = (
+			self.save_dir / f"net_{int(self.curr_step // self.save_every)}.chkpt"
+		)
+		torch.save(
+			dict(model=self.net.state_dict(), exploration_rate=self.exploration_rate),
+			save_path,
+		)
+		print(f"Dairy Queen Net saved to {save_path} at step {self.curr_step}")
+
+	def learn(self):
+		if self.curr_step % self.sync_every == 0:
+			self.sync_Q_target()
+
+		if self.curr_step % self.save_every == 0:
+			self.save()
+
+		if self.curr_step < self.burnin:
+			return None, None
+
+		if self.curr_step % self.learn_every != 0:
+			return None, None
+
+		# Sample from memory
+		state, next_state, action, reward, done = self.recall()
+
+		# Get TD Estimate
+		td_est = self.td_estimate(state, action)
+
+		# Get TD Target
+		td_tgt = self.td_target(reward, next_state, done)
+
+		# Backpropagate loss through Q_online
+		loss = self.update_Q_online(td_est, td_tgt)
+
+		return (td_est.mean().item(), loss)
 
 
 class JKGame:
@@ -199,18 +273,31 @@ class JKGame:
 
 		self.step_counter = 0
 		done = False
-		state = [self.king.levels.current_level, self.king.x, self.king.y, self.king.jumpCount]
+		# state = [self.king.levels.current_level, self.king.x, self.king.y, self.king.jumpCount]
+		state = self.get_screen_array()
 
 		self.visited = {}
 		self.visited[(self.king.levels.current_level, self.king.y)] = 1
 
-		return done, state
+		return state
 
 	def move_available(self):
 		available = not self.king.isFalling \
 					and not self.king.levels.ending \
 					and (not self.king.isSplat or self.king.splatCount > self.king.splatDuration)
 		return available
+
+	def get_screen_array(self):
+		screen_arr = pygame.surfarray.array2d(self.game_screen)
+		screen_arr = screen_arr.transpose()[np.newaxis, ...]
+		screen_arr = torch.tensor(screen_arr.copy(), dtype=torch.float)
+
+		transforms = T.Compose([
+			T.Resize((84, 84), antialias=True),
+			T.Normalize(0, 255)
+		])
+		screen_arr = transforms(screen_arr).squeeze(0)
+		return screen_arr
 
 	def step(self, action):
 		old_level = self.king.levels.current_level
@@ -222,17 +309,17 @@ class JKGame:
 			if not os.environ["pause"]:
 				if not self.move_available():
 					action = None
-				self._update_gamestuff(action=action)
+				self._update_gamestuff(action=action) # SEND A SINGLE COMMAND TO KING HERE
 
 			self._update_gamescreen()
 			self._update_guistuff()
 			self._update_audio()
 			pygame.display.update()
 
-
 			if self.move_available():
 				self.step_counter += 1
-				state = [self.king.levels.current_level, self.king.x, self.king.y, self.king.jumpCount]
+				# state = [self.king.levels.current_level, self.king.x, self.king.y, self.king.jumpCount]
+				state = self.get_screen_array()
 				##################################################################################################
 				# Define the reward from environment                                                             #
 				##################################################################################################
@@ -276,8 +363,22 @@ class JKGame:
 
 				self.environment.save()
 
-				self.menus.save()
+				self.menus.save ()
 
+				pygame.quit()
+				# screen_arr = pygame.surfarray.array2d(self.game_screen)
+				# screen_arr = screen_arr.transpose()[np.newaxis, ...]
+				# screen_arr = torch.tensor(screen_arr.copy(), dtype=torch.float)
+				#
+				# transforms = T.Compose([
+				# 	T.Resize((84, 84), antialias=True),
+				# 	T.Normalize(0, 255)
+				# ])
+				# screen_arr = transforms(screen_arr).squeeze(0)
+				#
+				# print(screen_arr.shape)
+				# plt.imshow(screen_arr, cmap='gray')
+				# plt.show()
 				sys.exit()
 
 			if event.type == pygame.KEYDOWN:
@@ -410,35 +511,55 @@ class JKGame:
 
 
 def train():
-	action_dict = {
-		0: 'right',
-		1: 'left',
-		2: 'right+space',
-		3: 'left+space',
-		# 4: 'idle',
-		# 5: 'space',
-	}
-	agent = DDQN()
+	use_cuda = torch.cuda.is_available()
+	print(f"Using CUDA: {use_cuda}")
+	print()
+
 	env = JKGame(max_step=1000)
-	num_episode = 100000
+	save_dir = Path("checkpoints") / datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+	save_dir.mkdir(parents=True)
 
-	for i in range(num_episode):
-		done, state = env.reset()
+	agent = DDQN(state_dim=(4, 84, 84), action_dim=4, save_dir=save_dir)
 
-		running_reward = 0
-		while not done:
-			action = agent.select_action(state)
-			#print(action_dict[action])
+	logger = MetricLogger(save_dir)
+
+	episodes = 40
+	for e in range(episodes):
+
+		state = env.reset()
+
+		# Play the game!
+		while True:
+
+			# Run agent on the state
+			action = agent.act(state)
+
+			# Agent performs action
 			next_state, reward, done = env.step(action)
 
-			running_reward += reward
-			sign = 1 if done else 0
-			agent.train(state, action, reward, next_state, sign)
+			# Remember
+			agent.cache(state, next_state, action, reward, done)
+
+			# Learn
+			q, loss = agent.learn()
+
+			# Logging
+			logger.log_step(reward, loss, q)
+
+			# Update state
 			state = next_state
-		print (f'episode: {i}, reward: {running_reward}')
+
+			# Check if end of game
+			if done:
+				break
+
+		logger.log_episode()
+
+		if (e % 20 == 0) or (e == episodes - 1):
+			logger.record(episode=e, epsilon=agent.exploration_rate, step=agent.curr_step)
 
 			
 if __name__ == "__main__":
-	#Game = JKGame()
-	#Game.running()
+	# Game = JKGame()
+	# Game.running()
 	train()

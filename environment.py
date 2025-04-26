@@ -15,7 +15,7 @@ class Environment:
 		os.environ["hitboxes"] = ""
 		os.environ["screen_width"], os.environ["screen_height"] = str(480), str(360)
 		os.environ["window_scale"] = "1"
-		os.environ["fps"] = str(60)
+		os.environ["fps"] = str(120)
 		os.environ["bg_color"] = str((0, 0, 0))
 		os.environ["mode"] = "normal"
 		os.environ["start"] = ""
@@ -49,6 +49,7 @@ class Environment:
 				os.environ["music"] = state["music"]
 				os.environ["ambience"] = state["ambience"]
 				os.environ["volume"] = state["volume"]
+				os.environ["hitboxes"] = state["hitboxes"]
 
 	def _load_stats(self):
 
@@ -91,7 +92,8 @@ class Environment:
 					"sfx" : os.environ.get("sfx"),
 					"music" : os.environ.get("music"),
 					"ambience" : os.environ.get("ambience"),
-					"volume" : os.environ.get("volume")
+					"volume" : os.environ.get("volume"),
+					"hitboxes" : os.environ.get("hitboxes"),
 		}
 
 		permanent_state = {
