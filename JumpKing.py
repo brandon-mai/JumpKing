@@ -8,232 +8,28 @@ from pathlib import Path
 import pygame 
 import sys
 import os
-import inspect
-import pickle
 import numpy as np
-from pygments.lexer import default
+import matplotlib.pyplot as plt
 
 from environment import Environment
-from spritesheet import SpriteSheet
-from Background import Backgrounds
 from King import King
 from Babe import Babe
 from Level import Levels
 from Menu import Menus
 from Start import Start
-from MetricLogger import MetricLogger
+from RL.metric_logger import MetricLogger
+from RL.DDQN import DDQN
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.optim as optim
-import random
-import time
-import matplotlib.pyplot as plt
 import torchvision.transforms as T
-from tensordict import TensorDict
-from torchrl.data import TensorDictReplayBuffer, LazyMemmapStorage
-
-
-class CNN(torch.nn.Module):
-	"""mini CNN structure
-	input -> (conv2d + relu) x 3 -> flatten -> (dense + relu) x 2 -> output
-	"""
-	def __init__(self, input_dim, output_dim):
-		super().__init__()
-		c, h, w = input_dim
-
-		if h != 84:
-			raise ValueError(f"Expecting input height: 84, got: {h}")
-		if w != 84:
-			raise ValueError(f"Expecting input width: 84, got: {w}")
-
-		self.online = self.__build_cnn(c, output_dim)
-		self.target = self.__build_cnn(c, output_dim)
-		self.target.load_state_dict(self.online.state_dict())
-
-		# Q_target parameters are frozen.
-		for p in self.target.parameters():
-			p.requires_grad = False
-
-	def forward(self, input, model):
-		if model == "online":
-			return self.online(input)
-		elif model == "target":
-			return self.target(input)
-
-	def __build_cnn(self, c, output_dim):
-		return nn.Sequential(
-			nn.Conv2d(in_channels=c, out_channels=32, kernel_size=8, stride=4), # 32x20x20
-			nn.ReLU(),
-			nn.Conv2d(in_channels=32, out_channels=64, kernel_size=4, stride=2), # 64x9x9
-			nn.ReLU(),
-			nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, stride=1), # 64x7x7
-			nn.ReLU(),
-			nn.Flatten(0),
-			nn.Linear(3136, 512),
-			nn.ReLU(),
-			nn.Linear(512, output_dim),
-		)
-
-
-class DDQN(object):
-	def __init__(self, state_dim, action_dim, save_dir):
-		self.state_dim = state_dim
-		self.action_dim = action_dim
-		self.save_dir = save_dir
-
-		self.device = "cuda" if torch.cuda.is_available() else "cpu"
-		self.net = CNN(self.state_dim, self.action_dim).float()
-		self.net = self.net.to(device=self.device)
-
-		self.exploration_rate = 1
-		self.exploration_rate_decay = 0.99999975
-		self.exploration_rate_min = 0.1
-		self.curr_step = 0
-		self.memory = TensorDictReplayBuffer(storage=LazyMemmapStorage(100000, device=torch.device("cpu")))
-		self.batch_size = 32
-		self.gamma = 0.9
-		self.optimizer = torch.optim.Adam(self.net.parameters(), lr=0.00025)
-		self.loss_fn = torch.nn.SmoothL1Loss()
-
-		self.burnin = 1e4  # min. experiences before training
-		self.learn_every = 3  # no. of experiences between updates to Q_online
-		self.sync_every = 1e4  # no. of experiences between Q_target & Q_online sync
-		self.save_every = 5e5  # no. of experiences between saving NETWORK
-
-	def act(self, state):
-		"""Given a state, choose an epsilon-greedy action and update value of step.
-		Args:
-			state (LazyFrame): A single observation of the current state, dimension is (state_dim)
-		Returns:
-			int: An integer representing which action Mario will perform
-		"""
-		# EXPLORE
-		if np.random.rand() < self.exploration_rate:
-			action_idx = np.random.randint(self.action_dim)
-
-		# EXPLOIT
-		else:
-			print("we are exploiting, baby")
-			state = state[0].__array__() if isinstance(state, tuple) else state.__array__()
-			state = torch.tensor(state, device=self.device).unsqueeze(0)
-			action_values = self.net(state, model="online")
-			action_idx = torch.argmax(action_values).item()
-
-		# decrease exploration_rate
-		self.exploration_rate *= self.exploration_rate_decay
-		self.exploration_rate = max(self.exploration_rate_min, self.exploration_rate)
-
-		# increment step
-		self.curr_step += 1
-		return action_idx
-
-	def cache(self, state, next_state, action, reward, done):
-		"""Store the experience to self.memory (replay buffer).
-        """
-		def first_if_tuple(x):
-			return x[0] if isinstance(x, tuple) else x
-
-		state = first_if_tuple(state).__array__()
-		next_state = first_if_tuple(next_state).__array__()
-
-		state = torch.tensor(state)
-		next_state = torch.tensor(next_state)
-		action = torch.tensor([action])
-		reward = torch.tensor([reward])
-		done = torch.tensor([done])
-
-		# self.memory.append((state, next_state, action, reward, done,))
-		self.memory.add(
-			TensorDict({"state": state, "next_state": next_state, "action": action, "reward": reward, "done": done},
-					   batch_size=[]))
-
-	def recall(self):
-		"""Retrieve a batch of experiences from memory
-        """
-		batch = self.memory.sample(self.batch_size).to(self.device)
-		state, next_state, action, reward, done = (batch.get(key) for key in
-												   ("state", "next_state", "action", "reward", "done"))
-		return state, next_state, action.squeeze(), reward.squeeze(), done.squeeze()
-
-	def td_estimate(self, state, action):
-		"""In-training net's TD estimation
-		"""
-		if state.shape[1] != 1:
-			state = state.permute(0, 3, 1, 2)
-
-		current_Q = self.net(state, model="online")[
-			np.arange(0, self.batch_size), action
-		]  # Q_online(s,a)
-		return current_Q
-
-	@torch.no_grad()
-	def td_target(self, reward, next_state, done):
-		"""Target net's TD estimation, following DDQN's formula
-		"""
-		if next_state.shape[1] != 1:
-			next_state = next_state.permute(0, 3, 1, 2)
-
-		next_state_Q = self.net(next_state, model="online")
-		best_action = torch.argmax(next_state_Q)
-		next_Q = self.net(next_state, model="target")[
-			np.arange(0, self.batch_size), best_action
-		]
-		return (reward + (1 - done.float()) * self.gamma * next_Q).float()
-
-	def update_Q_online(self, td_estimate, td_target):
-		loss = self.loss_fn(td_estimate, td_target)
-		self.optimizer.zero_grad()
-		loss.backward()
-		self.optimizer.step()
-		return loss.item()
-
-	def sync_Q_target(self):
-		self.net.target.load_state_dict(self.net.online.state_dict())
-
-	def save(self):
-		save_path = (
-			self.save_dir / f"net_{int(self.curr_step // self.save_every)}.chkpt"
-		)
-		torch.save(
-			dict(model=self.net.state_dict(), exploration_rate=self.exploration_rate),
-			save_path,
-		)
-		print(f"Dairy Queen Net saved to {save_path} at step {self.curr_step}")
-
-	def learn(self):
-		if self.curr_step % self.sync_every == 0:
-			self.sync_Q_target()
-
-		if self.curr_step % self.save_every == 0:
-			self.save()
-
-		if self.curr_step < self.burnin:
-			return None, None
-
-		if self.curr_step % self.learn_every != 0:
-			return None, None
-
-		# Sample from memory
-		state, next_state, action, reward, done = self.recall()
-
-		# Get TD Estimate
-		td_est = self.td_estimate(state, action)
-
-		# Get TD Target
-		td_tgt = self.td_target(reward, next_state, done)
-
-		# Backpropagate loss through Q_online
-		loss = self.update_Q_online(td_est, td_tgt)
-
-		return (td_est.mean().item(), loss)
 
 
 class JKGame:
 	""" Overall class to manga game aspects """
         
-	def __init__(self, max_step=float('inf'), fps=60):
+	def __init__(self, max_step=float('inf'), fps=60, cmap='rgb', span='full', edge_detect=False):
 
 		pygame.init()
 
@@ -270,9 +66,35 @@ class JKGame:
 
 		pygame.display.set_caption('Jump King At Home XD')
 
+		# Pre-define for better performance
+		self.cmap = cmap
+		self.span = span
+		self.edge_detect = edge_detect
+		self.crop_size = int(int(os.environ.get("screen_height")) * 0.5)
+		self.transforms = T.Compose([
+			T.Resize((84, 84), antialias=True),
+			T.Normalize(0, 255)
+		])
+		self.horizontal_kernel = torch.tensor([[-1, -1, -1],
+										  [2, 2, 2],
+										  [-1, -1, -1]], dtype=torch.float).unsqueeze(0).unsqueeze(0)
+
+		self.vertical_kernel = torch.tensor([[-1, 2, -1],
+										[-1, 2, -1],
+										[-1, 2, -1]], dtype=torch.float).unsqueeze(0).unsqueeze(0)
+
+		self.diagonal1_kernel = torch.tensor([[-1, -1, 2],
+										 [-1, 2, -1],
+										 [2, -1, -1]], dtype=torch.float).unsqueeze(0).unsqueeze(0)
+
+		self.diagonal2_kernel = torch.tensor([[2, -1, -1],
+										 [-1, 2, -1],
+										 [-1, -1, 2]], dtype=torch.float).unsqueeze(0).unsqueeze(0)
+
 	def reset(self):
 		self.king.reset()
 		self.levels.reset()
+		# self.levels.current_level = 2
 		os.environ["start"] = "1"
 		os.environ["gaming"] = "1"
 		os.environ["pause"] = ""
@@ -282,8 +104,7 @@ class JKGame:
 
 		self.step_counter = 0
 		done = False
-		# state = [self.king.levels.current_level, self.king.x, self.king.y, self.king.jumpCount]
-		state = self.get_screen_array()
+		state = self.get_screen_array(cmap=self.cmap, span=self.span)
 
 		self.visited = {}
 		self.visited[(self.king.levels.current_level, self.king.y)] = 1
@@ -302,30 +123,98 @@ class JKGame:
 					and (not self.king.isSplat or self.king.splatCount > self.king.splatDuration)
 		return available
 
-	def get_screen_array(self):
-		screen_arr = pygame.surfarray.array2d(self.game_screen)
-		screen_arr = screen_arr.transpose()[np.newaxis, ...]
-		screen_arr = torch.tensor(screen_arr.copy(), dtype=torch.float)
+	def get_screen_array(self, cmap=None, span=None, edge_detect=False):
+		# Use instance defaults if not specified
+		cmap = cmap or self.cmap
+		span = span or self.span
+		cmap = 'gray' if cmap and edge_detect else cmap
 
-		transforms = T.Compose([
-			T.Resize((84, 84), antialias=True),
-			T.Normalize(0, 255)
-		])
-		screen_arr = transforms(screen_arr).squeeze(0)
-		return screen_arr
+		# Get surface array directly in correct orientation
+		if cmap == 'gray':
+			screen_arr = np.transpose(pygame.surfarray.array2d(self.game_screen))
+			screen_arr = np.expand_dims(screen_arr, axis=0)  # Add channel dimension
+		elif cmap == 'rgb':
+			screen_arr = pygame.surfarray.array3d(self.game_screen)
+			screen_arr = np.ascontiguousarray(screen_arr.transpose(2, 1, 0))
+		else:
+			raise ValueError(f"Unsupported color map: {cmap}")
+
+		# Convert to tensor
+		screen_arr = torch.from_numpy(screen_arr).float()
+
+		if span == 'crop':
+			# Get king position
+			king_x, king_y = int(self.king.x), int(self.king.y)
+
+			# Use pre-calculated crop size
+			crop_size = self.crop_size
+			crop_size_double = crop_size * 2
+
+			# Create output tensor with exact size needed
+			channels = screen_arr.shape[0]
+			cropped = torch.zeros((channels, crop_size_double, crop_size_double),
+								  dtype=torch.float, device=screen_arr.device)
+
+			# Calculate crop boundaries
+			h, w = screen_arr.shape[1], screen_arr.shape[2]
+			top = king_y - crop_size
+			left = king_x - crop_size
+
+			# Compute valid source and destination regions
+			src_top = max(0, top)
+			src_left = max(0, left)
+			src_bottom = min(h, top + crop_size_double)
+			src_right = min(w, left + crop_size_double)
+
+			# Calculate destination offsets
+			dst_top = src_top - top
+			dst_left = src_left - left
+			h_slice = src_bottom - src_top
+			w_slice = src_right - src_left
+
+			# Only copy if there's actually content to copy
+			if h_slice > 0 and w_slice > 0:
+				cropped[:, dst_top:dst_top + h_slice, dst_left:dst_left + w_slice] = \
+					screen_arr[:, src_top:src_bottom, src_left:src_right]
+
+			screen_arr = cropped
+
+		# Apply edge detection if requested
+		if edge_detect:
+			horizontal_kernel = self.horizontal_kernel.to(screen_arr.device)
+			vertical_kernel = self.vertical_kernel.to(screen_arr.device)
+			diagonal1_kernel = self.diagonal1_kernel.to(screen_arr.device)
+			diagonal2_kernel = self.diagonal2_kernel.to(screen_arr.device)
+
+			# Pad input to maintain dimensions
+			padded_input = F.pad(screen_arr, (1, 1, 1, 1), mode='replicate')
+
+			# Apply convolutions
+			h_edges = F.conv2d(padded_input, horizontal_kernel)
+			v_edges = F.conv2d(padded_input, vertical_kernel)
+			d1_edges = F.conv2d(padded_input, diagonal1_kernel)
+			d2_edges = F.conv2d(padded_input, diagonal2_kernel)
+
+			# Combine edge responses
+			edges = torch.clamp(torch.abs(h_edges) + torch.abs(v_edges) +
+								torch.abs(d1_edges) + torch.abs(d2_edges), 0, 255)
+
+			# Normalize to [0, 1] range
+			screen_arr = edges / edges.max() if edges.max() > 0 else edges
+
+		return self.transforms(screen_arr)
 
 	def step(self, action):
 		# ================ Record values before taking actions ================
 		old_level = self.king.levels.current_level
 		old_y = self.king.y
-		#old_y = (self.king.levels.max_level - self.king.levels.current_level) * 360 + self.king.y
 
 		# ============= Convert action int to stream of keypress =============
 		match action:
 			case 0:
-				key_stream = ['right']
+				key_stream = ['right'] * 5
 			case 1:
-				key_stream = ['left']
+				key_stream = ['left'] * 5
 			case 2:
 				key_stream = ['space'] * 5 + ['right']
 			case 3:
@@ -351,23 +240,23 @@ class JKGame:
 				continue
 
 			try:
-				self._update_gamestuff(action=next(key_stream))
+				self._update_gamestuff(action=next(key_stream), mode='speed')
 				self.update_av()
 				continue
 			except StopIteration:
-				self._update_gamestuff(action=None)
+				self._update_gamestuff(action=None, mode='speed')
 				self.update_av()
 
 			if self.move_available():
 				self.step_counter += 1
 				# state = [self.king.levels.current_level, self.king.x, self.king.y, self.king.jumpCount]
-				state = self.get_screen_array()
+				state = self.get_screen_array(cmap=self.cmap, span=self.span, edge_detect=self.edge_detect)
 
 				# =========================== Define the reward from environment ===========================
 				if self.king.levels.current_level > old_level or (
-						self.king.levels.current_level == old_level and self.king.y < old_y):
-					reward = 0
-				else:
+						self.king.levels.current_level == old_level and self.king.y < old_y): # goes up
+					reward = 10
+				else: # goes down
 					current_key = (self.king.levels.current_level, self.king.y)
 					old_key = (old_level, old_y)
 
@@ -382,7 +271,7 @@ class JKGame:
 					# Negative reward based on visit count
 					reward = -self.visited[current_key]
 
-				done = True if self.step_counter > self.max_step else False
+				done = True if self.step_counter >= self.max_step else False
 				return state, reward, done
 
 	def running(self):
@@ -415,23 +304,34 @@ class JKGame:
 			if event.type == pygame.QUIT:
 
 				self.environment.save()
-
 				self.menus.save ()
-
 				pygame.quit()
-				# screen_arr = pygame.surfarray.array2d(self.game_screen)
-				# screen_arr = screen_arr.transpose()[np.newaxis, ...]
-				# screen_arr = torch.tensor(screen_arr.copy(), dtype=torch.float)
-				#
-				# transforms = T.Compose([
-				# 	T.Resize((84, 84), antialias=True),
-				# 	T.Normalize(0, 255)
-				# ])
-				# screen_arr = transforms(screen_arr).squeeze(0)
-				#
-				# print(screen_arr.shape)
-				# plt.imshow(screen_arr, cmap='gray')
+
+				# screen_arr = self.get_screen_array(cmap='gray', span='crop')  # (1, H, W)
+				# screen_arr = screen_arr.squeeze(0)  # (H, W)
+
+				# screen_arr = self.get_screen_array(cmap='gray', span='crop') # (C, H, W)
+				# screen_arr = screen_arr.transpose(0, 1).transpose(1, 2) # (H, W, C)
+				# plt.imshow(screen_arr)
+
+				regular = self.get_screen_array(cmap='gray', span='crop', edge_detect=False)
+				edge_detected = self.get_screen_array(cmap='gray', span='crop', edge_detect=True)
+
+				fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 5))
+				regular_img = regular.squeeze(0).cpu().numpy()
+				ax1.imshow(regular_img, cmap='gray')
+				ax1.set_title('Original Image')
+				ax1.axis('off')
+
+				# Display edge-detected image
+				edge_img = edge_detected.squeeze(0).cpu().numpy()
+				ax2.imshow(edge_img, cmap='gray')
+				ax2.set_title('Edge Detection')
+				ax2.axis('off')
+
+				plt.tight_layout()
 				# plt.show()
+
 				sys.exit()
 
 			if event.type == pygame.KEYDOWN:
@@ -452,9 +352,9 @@ class JKGame:
 
 				self._resize_screen(event.w, event.h)
 
-	def _update_gamestuff(self, action=None):
+	def _update_gamestuff(self, action=None, mode=None):
 
-		self.levels.update_levels(self.king, self.babe, agentCommand=action)
+		self.levels.update_levels(self.king, self.babe, agentCommand=action, mode=mode)
 
 	def _update_guistuff(self):
 
@@ -568,15 +468,13 @@ def train():
 	print(f"Using CUDA: {use_cuda}")
 	print()
 
-	env = JKGame(max_step=1000, fps=360)
+	env = JKGame(max_step=500, fps=720, cmap='gray', span='crop', edge_detect=False)
 	save_dir = Path("checkpoints") / datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
 	save_dir.mkdir(parents=True)
 	agent = DDQN(state_dim=(1, 84, 84), action_dim=8, save_dir=save_dir)
 	logger = MetricLogger(save_dir)
 
-	episodes = 10
-	test_action = [2] * 5 + [0] + [2] * 15 + [1] + [2] * 25 + [0] + [0] * 1000
-	test_action = iter(test_action)
+	episodes = 1000
 
 	for e in range(episodes):
 
@@ -587,7 +485,6 @@ def train():
 
 			# Run agent on the state
 			action = agent.act(state)
-			# action = next(test_action)
 
 			# Agent performs action
 			next_state, reward, done = env.step(action)
@@ -615,6 +512,6 @@ def train():
 
 			
 if __name__ == "__main__":
-	# Game = JKGame()
-	# Game.running()
-	train()
+	Game = JKGame()
+	Game.running()
+	# train()
