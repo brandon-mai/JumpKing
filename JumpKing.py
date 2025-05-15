@@ -10,6 +10,7 @@ import sys
 import os
 import numpy as np
 import matplotlib.pyplot as plt
+from tqdm import tqdm
 
 from environment import Environment
 from King import King
@@ -18,7 +19,8 @@ from Level import Levels
 from Menu import Menus
 from Start import Start
 from RL.metric_logger import MetricLogger
-from RL.DDQN import DDQN
+from RL.agent import PDD_DQN
+from RL.replay_buffer import ReplayBuffer
 
 import torch
 import torch.nn as nn
@@ -29,25 +31,24 @@ import torchvision.transforms as T
 class JKGame:
 	""" Overall class to manga game aspects """
         
-	def __init__(self, max_step=float('inf'), fps=60, cmap='rgb', span='full', edge_detect=False):
+	def __init__(self, max_step=float('inf'), training_mode=False, fps=60, cmap='rgb', span='full', edge_detect=False):
 
 		pygame.init()
 
+		self.training_mode = training_mode
+
 		self.environment = Environment()
-
 		self.clock = pygame.time.Clock()
-
 		self.fps = fps if isinstance(fps, int) else int(os.environ.get("fps"))
- 
 		self.bg_color = (0, 0, 0)
 
-		self.screen = pygame.display.set_mode((int(os.environ.get("screen_width")) * int(os.environ.get("window_scale")), int(os.environ.get("screen_height")) * int(os.environ.get("window_scale"))), pygame.HWSURFACE|pygame.DOUBLEBUF)#|pygame.SRCALPHA)
-
-		self.game_screen = pygame.Surface((int(os.environ.get("screen_width")), int(os.environ.get("screen_height"))), pygame.HWSURFACE|pygame.DOUBLEBUF)#|pygame.SRCALPHA)
-
-		self.game_screen_x = 0
-
+		self.screen = pygame.display.set_mode((int(os.environ.get("screen_width")) * int(os.environ.get("window_scale")), 
+												int(os.environ.get("screen_height")) * int(os.environ.get("window_scale"))), 
+											pygame.HWSURFACE|pygame.DOUBLEBUF)
 		pygame.display.set_icon(pygame.image.load("images\\sheets\\JumpKingIcon.ico"))
+
+		self.game_screen = pygame.Surface((int(os.environ.get("screen_width")), int(os.environ.get("screen_height"))), pygame.HWSURFACE|pygame.DOUBLEBUF)
+		self.game_screen_x = 0
 
 		self.levels = Levels(self.game_screen)
 
@@ -101,10 +102,12 @@ class JKGame:
 		os.environ["active"] = "1"
 		os.environ["attempt"] = str(int(os.environ.get("attempt")) + 1)
 		os.environ["session"] = "0"
+		os.environ["recording"] = "0"
 
 		self.step_counter = 0
-		done = False
-		state = self.get_screen_array(cmap=self.cmap, span=self.span)
+
+		self.update_av()
+		state = self.get_screen_array(cmap=self.cmap, span=self.span, edge_detect=self.edge_detect)
 
 		self.visited = {}
 		self.visited[(self.king.levels.current_level, self.king.y)] = 1
@@ -112,6 +115,7 @@ class JKGame:
 		return state
 
 	def update_av(self):
+		"""Update game screen, GUI, audio, and display."""
 		self._update_gamescreen()
 		self._update_guistuff()
 		self._update_audio()
@@ -205,74 +209,110 @@ class JKGame:
 		return self.transforms(screen_arr)
 
 	def step(self, action):
-		# ================ Record values before taking actions ================
+		# Record values before taking actions
 		old_level = self.king.levels.current_level
 		old_y = self.king.y
 
-		# ============= Convert action int to stream of keypress =============
+		# Convert action int to stream of keypress
 		match action:
 			case 0:
-				key_stream = ['right'] * 5
+				key_stream = ['left'] * 10
 			case 1:
-				key_stream = ['left'] * 5
+				key_stream = ['space'] * 10 + ['left']
 			case 2:
-				key_stream = ['space'] * 5 + ['right']
-			case 3:
-				key_stream = ['space'] * 5 + ['left']
-			case 4:
-				key_stream = ['space'] * 15 + ['right']
-			case 5:
 				key_stream = ['space'] * 15 + ['left']
+			case 3:
+				key_stream = ['space'] * 20 + ['left']
+			case 4:
+				key_stream = ['space'] * 25 + ['left']
+			case 5:
+				key_stream = ['space'] * 30 + ['leftspace']
 			case 6:
-				key_stream = ['space'] * 30 + ['right']
+				key_stream = ['right'] * 10
 			case 7:
-				key_stream = ['space'] * 30 + ['left']
+				key_stream = ['space'] * 10 + ['right']
+			case 8:
+				key_stream = ['space'] * 15 + ['right']
+			case 9:
+				key_stream = ['space'] * 20 + ['right']
+			case 10:
+				key_stream = ['space'] * 25 + ['right']
+			case 11:
+				key_stream = ['space'] * 30 + ['rightspace']
 			case _:
 				key_stream = [action]
 		key_stream = iter(key_stream)
 
-		while True:
-			self.clock.tick(self.fps)
-			self._check_events()
+		# Fast version for training mode
+		if self.training_mode:
+			while True:
+				self.clock.tick(self.fps)
+				self._check_events()
 
-			if os.environ["pause"]:
-				self.update_av()
-				continue
+				try:
+					self._update_gamestuff(action=next(key_stream), mode='speed')
+					continue
+				except StopIteration:
+					self._update_gamestuff(action=None, mode='speed')
 
-			try:
-				self._update_gamestuff(action=next(key_stream), mode='speed')
-				self.update_av()
-				continue
-			except StopIteration:
-				self._update_gamestuff(action=None, mode='speed')
-				self.update_av()
+				if self.move_available():
+					self.step_counter += 1
+					self.update_av()
+					state = self.get_screen_array(cmap=self.cmap, span=self.span, edge_detect=self.edge_detect)
 
-			if self.move_available():
-				self.step_counter += 1
-				# state = [self.king.levels.current_level, self.king.x, self.king.y, self.king.jumpCount]
-				state = self.get_screen_array(cmap=self.cmap, span=self.span, edge_detect=self.edge_detect)
+					# Define reward from environment
+					if self.king.levels.current_level > old_level or (
+							self.king.levels.current_level == old_level and self.king.y < old_y):
+						reward = 0
+					else:
+						current_key = (self.king.levels.current_level, self.king.y)
+						old_key = (old_level, old_y)
+						self.visited[current_key] = self.visited.get(current_key, 0) + 1
+						old_pos_count = self.visited.get(old_key, 0)
+						if self.visited[current_key] < old_pos_count:
+							self.visited[current_key] = old_pos_count + 1
+						reward = -self.visited[current_key]
 
-				# =========================== Define the reward from environment ===========================
-				if self.king.levels.current_level > old_level or (
-						self.king.levels.current_level == old_level and self.king.y < old_y): # goes up
-					reward = 10
-				else: # goes down
-					current_key = (self.king.levels.current_level, self.king.y)
-					old_key = (old_level, old_y)
+					done = True if self.step_counter >= self.max_step else False
+					return state, reward, done
+		
+		# Original slower version for full movement gameplay
+		else:
+			while True:
+				self.clock.tick(self.fps)
+				self._check_events()
 
-					# Update current position visit count
-					self.visited[current_key] = self.visited.get(current_key, 0) + 1
+				if os.environ["pause"]:
+					self.update_av()
+					continue
 
-					# If current position has been visited less than previous, add previous count as base count
-					old_pos_count = self.visited.get(old_key, 0)
-					if self.visited[current_key] < old_pos_count:
-						self.visited[current_key] = old_pos_count + 1
+				try:
+					self._update_gamestuff(action=next(key_stream), mode='speed')
+					self.update_av()
+					continue
+				except StopIteration:
+					self._update_gamestuff(action=None, mode='speed')
+					self.update_av()
 
-					# Negative reward based on visit count
-					reward = -self.visited[current_key]
+				if self.move_available():
+					self.step_counter += 1
+					state = self.get_screen_array(cmap=self.cmap, span=self.span, edge_detect=self.edge_detect)
 
-				done = True if self.step_counter >= self.max_step else False
-				return state, reward, done
+					# Define reward from environment
+					if self.king.levels.current_level > old_level or (
+							self.king.levels.current_level == old_level and self.king.y < old_y):
+						reward = 0
+					else:
+						current_key = (self.king.levels.current_level, self.king.y)
+						old_key = (old_level, old_y)
+						self.visited[current_key] = self.visited.get(current_key, 0) + 1
+						old_pos_count = self.visited.get(old_key, 0)
+						if self.visited[current_key] < old_pos_count:
+							self.visited[current_key] = old_pos_count + 1
+						reward = -self.visited[current_key]
+
+					done = True if self.step_counter >= self.max_step else False
+					return state, reward, done
 
 	def running(self):
 		"""
@@ -280,9 +320,26 @@ class JKGame:
 		:return:
 		"""
 		self.reset()
+
+		# Buffer for recording mode
+		state_sample = self.get_screen_array(cmap=self.cmap, span=self.span, edge_detect=self.edge_detect)
+		demo_buffer = ReplayBuffer(
+			capacity=1000, state_dim=state_sample.shape,
+			alpha=0.6, n_step=10, gamma=0.99,
+		)
+
+		# Try to load existing demonstrations if available
+		demo_file = "demonstrations.pkl"
+		demo_buffer.load_from_file(demo_file)
+
+		old_state = None
+		old_level = None
+		old_y = None
+		key_stream = iter([])
+		action = None
+		recording = False  # whether the game is recording an experience
+
 		while True:
-			#state = [self.king.levels.current_level, self.king.x, self.king.y, self.king.jumpCount]
-			#print(state)
 			self.clock.tick(self.fps)
 			self._check_events()
 
@@ -290,19 +347,98 @@ class JKGame:
 				self.update_av()
 				continue
 
-			self._update_gamestuff()
+			if os.environ["recording"] == "0":
+				self._update_gamestuff(mode='speed')
+				self.update_av()
+			else: # recording mode
+				try: # execute key stream whenever one is available
+					self._update_gamestuff(action=next(key_stream), mode='speed')
+					self.update_av()
+					continue
 
-			self._update_gamescreen()
-			self._update_guistuff()
-			self._update_audio()
-			pygame.display.update()
+				except StopIteration: # key stream depleted
+					if self.move_available() and recording: # idle after executing key stream, record results
+						if self.king.levels.current_level > old_level or (
+								self.king.levels.current_level == old_level and self.king.y < old_y):
+							new_state = self.get_screen_array(cmap=self.cmap, span=self.span, edge_detect=self.edge_detect)
+							
+							if demo_buffer.size < demo_buffer.capacity:
+								demo_buffer.add(
+									old_state.cpu().numpy(),
+									action,
+									0, # reward for higher ground/level
+									new_state.cpu().numpy(),
+									False, # Not done
+									demo=True, # expert demonstration,
+									verbose=True
+								)
+							else:
+								print("Buffer full, not adding experience")
+
+						recording = False
+
+					if self.move_available(): # idle, waiting for key stream command
+						keys = pygame.key.get_pressed()
+
+						if keys[pygame.K_f] and keys[pygame.K_1]:
+							key_stream = ['left'] * 10
+							action = 0
+						elif keys[pygame.K_f] and keys[pygame.K_2]:
+							key_stream = ['space'] * 10 + ['left']
+							action = 1
+						elif keys[pygame.K_f] and keys[pygame.K_3]:
+							key_stream = ['space'] * 15 + ['left']
+							action = 2
+						elif keys[pygame.K_f] and keys[pygame.K_4]:
+							key_stream = ['space'] * 20 + ['left']
+							action = 3
+						elif keys[pygame.K_f] and keys[pygame.K_5]:
+							key_stream = ['space'] * 25 + ['left']
+							action = 4
+						elif keys[pygame.K_f] and keys[pygame.K_6]:
+							key_stream = ['space'] * 30 + ['leftspace']
+							action = 5
+
+						elif keys[pygame.K_j] and keys[pygame.K_1]:
+							key_stream = ['right'] * 10
+							action = 6
+						elif keys[pygame.K_j] and keys[pygame.K_2]:
+							key_stream = ['space'] * 10 + ['right']
+							action = 7
+						elif keys[pygame.K_j] and keys[pygame.K_3]:
+							key_stream = ['space'] * 15 + ['right']
+							action = 8
+						elif keys[pygame.K_j] and keys[pygame.K_4]:
+							key_stream = ['space'] * 20 + ['right']
+							action = 9
+						elif keys[pygame.K_j] and keys[pygame.K_5]:
+							key_stream = ['space'] * 25 + ['right']
+							action = 10
+						elif keys[pygame.K_j] and keys[pygame.K_6]:
+							key_stream = ['space'] * 30 + ['rightspace']
+							action = 11
+						else:
+							key_stream = []
+
+						if keys[pygame.K_s]:
+							demo_buffer.save_to_file(demo_file)
+							print(f"Manually saved {demo_buffer.size} demonstrations")
+
+						if key_stream:
+							recording = True
+							old_state = self.get_screen_array(
+								cmap=self.cmap, span=self.span, edge_detect=self.edge_detect)
+							old_level = self.king.levels.current_level
+							old_y = self.king.y
+
+						key_stream = iter(key_stream)
+
+				self._update_gamestuff(action=None, mode='speed')
+				self.update_av()
 
 	def _check_events(self):
-
 		for event in pygame.event.get():
-
 			if event.type == pygame.QUIT:
-
 				self.environment.save()
 				self.menus.save ()
 				pygame.quit()
@@ -310,24 +446,30 @@ class JKGame:
 				# screen_arr = self.get_screen_array(cmap='gray', span='crop')  # (1, H, W)
 				# screen_arr = screen_arr.squeeze(0)  # (H, W)
 
-				# screen_arr = self.get_screen_array(cmap='gray', span='crop') # (C, H, W)
+				# screen_arr = self.get_screen_array(cmap='rgb', span='crop') # (C, H, W)
 				# screen_arr = screen_arr.transpose(0, 1).transpose(1, 2) # (H, W, C)
 				# plt.imshow(screen_arr)
 
-				regular = self.get_screen_array(cmap='gray', span='crop', edge_detect=False)
-				edge_detected = self.get_screen_array(cmap='gray', span='crop', edge_detect=True)
+				regular = self.get_screen_array(cmap='rgb', span='crop') # (C, H, W)
+				regular = regular.transpose(0, 1).transpose(1, 2) # (H, W, C)
 
-				fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 5))
-				regular_img = regular.squeeze(0).cpu().numpy()
-				ax1.imshow(regular_img, cmap='gray')
-				ax1.set_title('Original Image')
-				ax1.axis('off')
+				plt.figure(figsize=(10, 10))
+				plt.subplot(2, 2, 1)
+				regular_img = regular.cpu().numpy()
+				plt.imshow(regular_img)
 
-				# Display edge-detected image
-				edge_img = edge_detected.squeeze(0).cpu().numpy()
-				ax2.imshow(edge_img, cmap='gray')
-				ax2.set_title('Edge Detection')
-				ax2.axis('off')
+				plt.subplot(2, 2, 2)
+				# plt.plot(np.arange(0, 84), regular_img[:, 42, 0], label='R Channel', color='red')
+				# plt.plot(np.arange(0, 84), regular_img[:, 42, 1], label='G Channel', color='green')
+				# plt.plot(np.arange(0, 84), regular_img[:, 42, 2], label='B Channel', color='blue')
+				plt.plot(regular_img[:, 42, 0], -np.arange(0, 84), label='R Channel', color='red')
+				plt.plot(regular_img[:, 42, 1], -np.arange(0, 84), label='G Channel', color='green')
+				plt.plot(regular_img[:, 42, 2], -np.arange(0, 84), label='B Channel', color='blue')
+
+				plt.subplot(2, 2, 3)
+				plt.plot(np.arange(0, 84), regular_img[42, :, 0], label='R Channel', color='red')
+				plt.plot(np.arange(0, 84), regular_img[42, :, 1], label='G Channel', color='green')
+				plt.plot(np.arange(0, 84), regular_img[42, :, 2], label='B Channel', color='blue')
 
 				plt.tight_layout()
 				# plt.show()
@@ -337,19 +479,22 @@ class JKGame:
 			if event.type == pygame.KEYDOWN:
 
 				self.menus.check_events(event)
-
+				# Creative mode
 				if event.key == pygame.K_c:
-
 					if os.environ["mode"] == "creative":
-
 						os.environ["mode"] = "normal"
-
 					else:
-
 						os.environ["mode"] = "creative"
+
+				# Recording mode
+				if event.key == pygame.K_r:
+					if os.environ.get("recording", "0") == "1":
+						os.environ["recording"] = "0"
+					else:
+						print('recording mode ON')
+						os.environ["recording"] = "1"
 					
 			if event.type == pygame.VIDEORESIZE:
-
 				self._resize_screen(event.w, event.h)
 
 	def _update_gamestuff(self, action=None, mode=None):
@@ -463,15 +608,146 @@ class JKGame:
 			pygame.mixer.Channel(channel).set_volume(float(os.environ.get("volume")))
 
 
+def play():
+	""" Play the game with the keyboard."""
+	Game = JKGame(cmap='rgb', span='crop', edge_detect=False)
+	Game.running()
+
+
+def pretrain():
+    """Pretrain the agent with demonstrations."""
+    use_cuda = torch.cuda.is_available()
+    print(f"Using CUDA: {use_cuda}")
+    
+    # Create save directory
+    save_dir = Path("checkpoints") / datetime.now().strftime("pretrain_%Y-%m-%dT%H-%M-%S")
+    save_dir.mkdir(parents=True)
+    
+    # Initialize agent
+    agent = PDD_DQN(state_dim=(3, 84, 84), action_dim=12, save_dir=save_dir)
+    logger = MetricLogger(save_dir)
+    
+    # Load expert demonstrations
+    demo_file = "demonstrations.pkl"
+    if not os.path.exists(demo_file):
+        print(f"Error: Demonstration file '{demo_file}' not found!")
+        return
+    
+    # Create a replay buffer with the right dimensions
+    state_sample_shape = (3, 84, 84)  # RGB image
+    demo_buffer = ReplayBuffer(
+        capacity=1000,
+        state_dim=state_sample_shape,
+        alpha=0.6,
+        n_step=10,
+        gamma=0.99
+    )
+    
+    # Load demonstrations
+    if demo_buffer.load_from_file(demo_file):
+        print(f"Successfully loaded demonstrations. Buffer has {demo_buffer.size} experiences.")
+        # Set the agent's replay buffer to the loaded buffer
+        agent.memory = demo_buffer
+    else:
+        print("Failed to load demonstrations, aborting pretraining.")
+        return
+    
+    # Check if we have enough demos
+    if demo_buffer.size < agent.batch_size:
+        print(f"Error: Not enough demonstrations ({demo_buffer.size}) for pretraining! Need at least {agent.batch_size}.")
+        return
+    
+    # Pretraining settings
+    pretrain_steps = 50000
+    print_interval = 5000
+    save_interval = pretrain_steps
+    
+    print(f"Starting pretraining for {pretrain_steps} steps...")
+    
+    # During pretraining we want no exploration
+    agent.exploration_rate = 0.01
+    agent.exploration_rate_min = 0.01
+    
+    # Store pretrain metrics
+    pretrain_losses = []
+    pretrain_q_values = []
+    
+    # Perform pretraining
+    for step in tqdm(range(pretrain_steps), desc="Pretraining", unit="step"):
+		# No action taken so we have to manually increment the step
+        agent.curr_step += 1
+
+        # Force sampling of demo data during pretraining
+        q, loss = agent.learn()
+        
+        # Store metrics
+        if q is not None and loss is not None:
+            pretrain_losses.append(loss)
+            pretrain_q_values.append(q)
+            logger.log_step(0, loss, q)  # Reward is 0 since we're not interacting with environment
+        
+        # Print progress
+        if (step + 1) % print_interval == 0:
+            avg_loss = np.mean(pretrain_losses[-print_interval:]) if pretrain_losses else 0
+            avg_q = np.mean(pretrain_q_values[-print_interval:]) if pretrain_q_values else 0
+            print(f"Pretraining Step {step+1}/{pretrain_steps} | Avg Loss: {avg_loss:.5f} | Avg Q-Value: {avg_q:.5f}")
+            
+        # Save model periodically
+        # if (step + 1) % save_interval == 0:
+        #     save_path = save_dir / f"pretrain_step_{step+1}.chkpt"
+        #     torch.save(
+        #         dict(
+        #             model=agent.net.state_dict(),
+        #             exploration_rate=agent.exploration_rate,
+        #             pretrain_step=step+1,
+        #             pretrain_total_steps=pretrain_steps
+        #         ),
+        #         save_path
+        #     )
+        #     print(f"Saved pretraining checkpoint to {save_path}")
+    
+    # Save final pretrained model
+    final_save_path = save_dir / "pretrain_final.chkpt"
+    torch.save(
+        dict(
+            model=agent.net.state_dict(),
+            pretrained=True,
+            pretrain_steps=pretrain_steps
+        ),
+        final_save_path
+    )
+    print(f"Pretraining complete! Final model saved to {final_save_path}")
+    
+    # Generate pretraining metrics plot
+    if pretrain_losses:
+        plt.figure(figsize=(12, 5))
+        plt.subplot(1, 2, 1)
+        plt.plot(pretrain_losses)
+        plt.title('Pretraining Loss')
+        plt.xlabel('Step')
+        plt.ylabel('Loss')
+        
+        plt.subplot(1, 2, 2)
+        plt.plot(pretrain_q_values)
+        plt.title('Pretraining Q-Values')
+        plt.xlabel('Step')
+        plt.ylabel('Q-Value')
+        
+        plt.tight_layout()
+        plt.savefig(save_dir / "pretrain_metrics.png")
+        print(f"Pretraining metrics saved to {save_dir / 'pretrain_metrics.png'}")
+
+
 def train():
+	""" Train the agent with environment."""
 	use_cuda = torch.cuda.is_available()
 	print(f"Using CUDA: {use_cuda}")
 	print()
 
-	env = JKGame(max_step=500, fps=720, cmap='gray', span='crop', edge_detect=False)
+	env = JKGame(max_step=500, training_mode=True, fps=900, cmap='rgb', span='crop', edge_detect=False)
 	save_dir = Path("checkpoints") / datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
 	save_dir.mkdir(parents=True)
-	agent = DDQN(state_dim=(1, 84, 84), action_dim=8, save_dir=save_dir)
+	agent = PDD_DQN(state_dim=(3, 84, 84), action_dim=12, save_dir=save_dir)
 	logger = MetricLogger(save_dir)
 
 	episodes = 1000
@@ -512,6 +788,7 @@ def train():
 
 			
 if __name__ == "__main__":
-	Game = JKGame()
-	Game.running()
+	# play()
+	pretrain()
 	# train()
+

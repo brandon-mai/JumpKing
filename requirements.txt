@@ -1,0 +1,6 @@
+setuptools==78.1.1
+wheel==0.45.1
+
+zlib==1.2.13
+pip==25.1
+openssl==3.0.16

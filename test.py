@@ -1,6 +1,10 @@
-state_dim = (3, 84, 84)
-capacity = 2
+from collections import deque
 
-a = (capacity, *state_dim)
+queue = deque(maxlen=10)
+for i in range(20):
+    queue.append(i)
+    print(list(queue))
 
-print(a)
+for _ in range(5):
+    queue.pop()
+    print(list(queue))

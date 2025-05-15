@@ -55,6 +55,16 @@ def get_action_dict(agentCommand):
 		keys[pygame.K_RIGHT] = 0
 		keys[pygame.K_LEFT] = 1
 
+	elif agentCommand == 'rightspace':
+		keys[pygame.K_SPACE] = 1
+		keys[pygame.K_RIGHT] = 1
+		keys[pygame.K_LEFT] = 0
+
+	elif agentCommand == 'leftspace':
+		keys[pygame.K_SPACE] = 1
+		keys[pygame.K_RIGHT] = 0
+		keys[pygame.K_LEFT] = 1
+
 	else:
 		print(agentCommand)
 		raise ValueError('Invalid action')
